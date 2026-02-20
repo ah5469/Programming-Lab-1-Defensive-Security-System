@@ -34,8 +34,12 @@ class ABFile():
 
 
   def writeat(self,data,offset):
-    
     # Write the requested data to the B file using the sandbox's writeat call
+    current_len = len(self.Bfile.readad(None, 0))
+    needed_len = offset + len(data)
+    if needed_len > current_len:
+      self.Bfile.writeat('\0' * (needed_len - current_len), current_len)
+
     self.Bfile.writeat(data,offset)
   
   def readat(self,bytes,offset):
