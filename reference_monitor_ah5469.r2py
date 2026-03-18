@@ -1,4 +1,3 @@
-#Contents
 """
 This security layer inadequately handles A/B storage for files in RepyV2.
 
@@ -18,6 +17,21 @@ TARGET="target"
 FUNC="func"
 OBJC="objc"
 
+# Global lock registry: one lock per filename, shared across all threads.
+# The lock is acquired when a file is opened and released only when it is
+# closed, ensuring that only one thread can use a given file at a time.
+mycontext['file_locks'] = {}
+mycontext['registry_lock'] = createlock()
+
+def _get_file_lock(filename):
+  mycontext['registry_lock'].acquire(True)
+  try:
+    if filename not in mycontext['file_locks']:
+      mycontext['file_locks'][filename] = createlock()
+    return mycontext['file_locks'][filename]
+  finally:
+    mycontext['registry_lock'].release()
+
 class ABFile():
   def __init__(self,filename,create):
     # globals
@@ -26,32 +40,76 @@ class ABFile():
     self.Afn = filename+'.a'
     self.Bfn = filename+'.b'
 
+    # Acquire the session-level lock for this filename.
+    # Held until close(), so only one thread can use this file at a time.
+    self.lock = _get_file_lock(filename)
+    self.lock.acquire(True)
+
     # make the files and add 'SE' to the readat file...
     if create:
+      # Delete A and B if they already exist so we start with clean files.
+      # RepyV2's openfile(create=True) does NOT truncate existing files,
+      # so stale bytes would remain if we skip this step.
+      if self.Afn in listfiles():
+        removefile(self.Afn)
+      if self.Bfn in listfiles():
+        removefile(self.Bfn)
       self.Afile = openfile(self.Afn,create)
       self.Bfile = openfile(self.Bfn,create)
       self.Afile.writeat('SE',0)
+    else:
+      self.Afile = openfile(self.Afn, False)
+      # Delete and recreate B so there are no stale bytes from a previous session
+      if self.Bfn in listfiles():
+        removefile(self.Bfn)
+      self.Bfile = openfile(self.Bfn, True)
+      self.Bfile.writeat(self.Afile.readat(None, 0), 0)
 
 
   def writeat(self,data,offset):
-    # Write the requested data to the B file using the sandbox's writeat call
-    current_b = self.Bfile.readat(None, 0)
-    current_len = len(current_b)
+    # Session lock is already held from __init__ — no need to re-acquire.
+    # Read the current contents of B to understand its state.
+    temp_content = self.Bfile.readat(None, 0)
+    new_end = offset + len(data)
 
-    # To handle if write goes past the EOF
-    needed_len = offset + len(data)
-    if needed_len > current_len:
-        self.Bfile.writeat('\0' * (needed_len - current_len), current_len)
-    
-    self.Bfile.writeat(data,offset)
+    if new_end < len(temp_content):
+      # This write lands in the middle and is shorter than current content.
+      # Reconstruct: keep everything before offset, apply new data, keep tail.
+      # This correctly preserves bytes after the write that were not overwritten.
+      new_content = temp_content[:offset] + data + temp_content[new_end:]
+      self.Bfile.close()
+      removefile(self.Bfn)
+      self.Bfile = openfile(self.Bfn, True)
+      self.Bfile.writeat(new_content, 0)
+    else:
+      # Write extends to or past the current end — no stale tail possible.
+      if offset > len(temp_content):
+        # Fill any gap between current end and offset with null bytes
+        self.Bfile.writeat('\0' * (offset - len(temp_content)), len(temp_content))
+      # Write the requested data to the B file using the sandbox's writeat call
+      self.Bfile.writeat(data,offset)
   
   def readat(self,bytes,offset):
+    # Session lock is already held from __init__ — no need to re-acquire.
     # Read from the A file using the sandbox's readat...
     return self.Afile.readat(bytes,offset)
 
   def close(self):
+    # Final validation and commit.
+    # Read the final state of B after all multiple writes are finished.
+    final_contents = self.Bfile.readat(None, 0)
+    # Validate 'S' and 'E'
+    if len(final_contents) >= 2 and final_contents[0] == 'S' and final_contents[-1] == 'E':
+      # Delete and recreate A cleanly to avoid stale trailing bytes
+      self.Afile.close()
+      removefile(self.Afn)
+      self.Afile = openfile(self.Afn, True)
+      self.Afile.writeat(final_contents, 0)
+
     self.Afile.close()
     self.Bfile.close()
+    # Release the session-level lock so other threads can now use this file
+    self.lock.release()
 
 
 def ABopenfile(filename, create):
@@ -73,22 +131,3 @@ CHILD_CONTEXT_DEF["ABopenfile"] = {TYPE:OBJC,ARGS:(str,bool),EXCP:Exception,RETU
 
 # Execute the user code
 secure_dispatch_module()
-
-
-if "testfile.txt.a" in listfiles():
-  removefile("testfile.txt.a")
-if "testfile.txt.b" in listfiles():
-  removefile("testfile.txt.b")
-myfile=ABopenfile("testfile.txt",True)  #Create an AB file
-
-# I should get 'SE' when reading an empty file...
-assert('SE' == myfile.readat(None,0))
-
-# put some valid data in the file.
-myfile.writeat("Stest12345E",0)
-
-# I should still get 'SE' because the file wasn't closed.
-assert('SE' == myfile.readat(None,0))
-
-#Close the file
-myfile.close()
